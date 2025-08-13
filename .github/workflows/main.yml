@@ -1,85 +1,99 @@
-name: Extract mosproxy and Create Release
+name: Release mosproxy from GHCR
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+    inputs:
+      tag:
+        description: 'Release tag (默认: 自动生成，如 v2025.08.13)'
+        required: false
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
 
 jobs:
-  extract-and-release:
-    runs-on: ${{ matrix.runner }}
+  extract:
+    name: Extract mosproxy (${{ matrix.platform }})
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-        architecture: [amd64, arm64]
-    permissions:
-      contents: write
-      packages: read
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+
     steps:
-      # 检出仓库代码
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 登录 GitHub Container Registry
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 拉取镜像并提取 /usr/bin/mosproxy
-      - name: Extract mosproxy binary
+      - name: Pull image (platform ${{ matrix.platform }})
         run: |
-          docker pull ghcr.io/irinesistiana/mosproxy:dev
-          docker create --name mosproxy_temp ghcr.io/irinesistiana/mosproxy:dev
-          docker cp mosproxy_temp:/usr/bin/mosproxy mosproxy-${{ matrix.architecture }}
-          docker rm mosproxy_temp
+          docker pull --platform ${{ matrix.platform }} ghcr.io/irinesistiana/mosproxy:dev
 
-      # 上传提取的二进制文件作为构建产物
-      - name: Upload mosproxy binary
+      - name: Create container and copy binary
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          CID=$(docker create --platform ${{ matrix.platform }} ghcr.io/irinesistiana/mosproxy:dev)
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          docker cp "$CID":/usr/bin/mosproxy ./mosproxy-linux-${{ matrix.arch }}
+          chmod +x ./mosproxy-linux-${{ matrix.arch }}
+          sha256sum ./mosproxy-linux-${{ matrix.arch }} | tee mosproxy-linux-${{ matrix.arch }}.sha256
+
+      - name: Upload artifact (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
-          name: mosproxy-${{ matrix.architecture }}
-          path: mosproxy-${{ matrix.architecture }}
-          retention-days: 1
+          name: mosproxy-${{ matrix.arch }}
+          path: |
+            mosproxy-linux-${{ matrix.arch }}
+            mosproxy-linux-${{ matrix.arch }}.sha256
 
-      # 创建 Release 并上传二进制文件
-      - name: Create Release and Upload Assets
-        if: matrix.runner == 'ubuntu-latest'  # 仅在 amd64 运行器上创建 Release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: extract
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
+          path: dist
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          find dist -type f -print
+          # 扁平化到 dist_root 目录
+          mkdir -p dist_root
+          find dist -type f -name 'mosproxy-*' -exec cp -f {} dist_root/ \;
+
+      - name: Compute default tag if empty
+        id: tag
+        shell: bash
+        run: |
+          if [ -z "${{ github.event.inputs.tag }}" ]; then
+            TAG="v$(date -u +'%Y.%m.%d')"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create/Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           draft: false
-          prerelease: false
-          body: |
-            Mosproxy binary extracted from ghcr.io/irinesistiana/mosproxy:dev for multiple architectures.
-        continue-on-error: true
-
-      # 下载并上传 arm64 二进制文件到 Release
-      - name: Upload arm64 binary to Release
-        if: matrix.runner == 'ubuntu-24.04-arm'
-        uses: actions/upload-release-asset@v1
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: |
+            dist_root/mosproxy-linux-amd64
+            dist_root/mosproxy-linux-amd64.sha256
+            dist_root/mosproxy-linux-arm64
+            dist_root/mosproxy-linux-arm64.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create-release.outputs.upload_url }}
-          asset_path: mosproxy-arm64
-          asset_name: mosproxy-arm64
-          asset_content_type: application/octet-stream
-
-      # 下载并上传 amd64 二进制文件到 Release
-      - name: Upload amd64 binary to Release
-        if: matrix.runner == 'ubuntu-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create-release.outputs.upload_url }}
-          asset_path: mosproxy-amd64
-          asset_name: mosproxy-amd64
-          asset_content_type: application/octet-stream
